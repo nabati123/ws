@@ -2,7 +2,7 @@
 **Release Notes:** [HERE](https://github.com/NevermoreSSH/SkyNode/blob/main/releasenotes.txt) (Last updated: 13/11/2026)
 
 
-♦️Autoscript SSH XRAYS Websocket Multiport By NevermoreSSH♦️
+♦️Autoscript SSH XRAYS Websocket Multiport By Skytech♦️
 
 ⚠️ System Requirements ⚠️
 - Minimum 1GB RAM
