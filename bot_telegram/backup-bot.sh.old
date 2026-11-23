@@ -1,0 +1,244 @@
+#!/bin/bash
+# =========================================
+# Backup Config - Telegram + Google Drive
+# Author: NevermoreSSH
+# Edition: V2.4 Auto Backup
+# Daily schedule: 08:00 server local time
+# =========================================
+set -Eeuo pipefail
+umask 077
+
+CONFIG_DIR='/root/.config/nevermoressh'
+TELEGRAM_CONFIG="$CONFIG_DIR/telegram.conf"
+DEFAULT_TOKEN='9292915493:AAGeVkT0xOmyyfuGZUb4ukurtP0sBZt3Ww8'
+DEFAULT_CHAT_ID='5355864338'
+GDRIVE_REMOTE='dr:backup'
+SCRIPT_PATH='/usr/local/bin/backup-bot'
+CRON_FILE='/etc/cron.d/nevermoressh-backup'
+LOG_FILE='/var/log/nevermoressh-backup.log'
+RED='\033[1;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
+info() { printf '[ INFO ] %s\n' "$*"; }
+warn() { printf "${YELLOW}[ WARNING ]${NC} %s\n" "$*" >&2; }
+fail() { printf "${RED}[ ERROR ]${NC} %s\n" "$*" >&2; return 1; }
+pause() { read -r -p 'Press Enter to continue...' _ || true; }
+init_config() {
+  mkdir -p "$CONFIG_DIR"; chmod 700 "$CONFIG_DIR"
+  if [[ ! -e "$TELEGRAM_CONFIG" ]]; then
+    (umask 077; printf 'BOT_TOKEN=%s\nCHAT_ID=%s\n' "$DEFAULT_TOKEN" "$DEFAULT_CHAT_ID" > "$TELEGRAM_CONFIG")
+  fi
+  [[ ! -e "$TELEGRAM_CONFIG" ]] || chmod 600 "$TELEGRAM_CONFIG"
+}
+read_telegram() {
+  BOT_TOKEN=''; CHAT_ID=''
+  [[ -f "$TELEGRAM_CONFIG" ]] || return 0
+  local key value
+  while IFS='=' read -r key value || [[ -n "$key" ]]; do
+    case "$key" in BOT_TOKEN) BOT_TOKEN="$value";; CHAT_ID) CHAT_ID="$value";; esac
+  done < "$TELEGRAM_CONFIG"
+}
+valid_token() { [[ "$1" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]]; }
+valid_chat() { [[ "$1" =~ ^-?[0-9]+$ || "$1" =~ ^@[A-Za-z][A-Za-z0-9_]{4,}$ ]]; }
+set_telegram() {
+  local token chat tmp
+  printf 'Enter Telegram Bot Token (hidden): '
+  IFS= read -r -s token; printf '\n'
+  valid_token "$token" || { fail 'Invalid Bot Token format'; return 1; }
+  read -r -p 'Enter Telegram Chat ID: ' chat
+  valid_chat "$chat" || { fail 'Invalid Chat ID format'; return 1; }
+  tmp=$(mktemp "$CONFIG_DIR/.telegram.XXXXXX") || return 1
+  printf 'BOT_TOKEN=%s\nCHAT_ID=%s\n' "$token" "$chat" > "$tmp"
+  chmod 600 "$tmp"; mv -f "$tmp" "$TELEGRAM_CONFIG"
+  info 'Telegram credentials saved.'
+}
+reset_telegram() {
+  local answer
+  read -r -p 'Reset Telegram settings to the built-in defaults? [y/N]: ' answer
+  if [[ "$answer" =~ ^[yY]$ ]]; then
+    (umask 077; printf 'BOT_TOKEN=%s\nCHAT_ID=%s\n' "$DEFAULT_TOKEN" "$DEFAULT_CHAT_ID" > "$TELEGRAM_CONFIG")
+    chmod 600 "$TELEGRAM_CONFIG"
+    info 'Default Telegram settings restored.'
+  else info 'Reset cancelled.'; fi
+}
+install_packages() {
+  apt update && apt install -y curl zip p7zip-full python3 rclone cron
+}
+check_deps() {
+  local cmd
+  for cmd in curl zip rclone python3 flock; do
+    command -v "$cmd" >/dev/null || { fail "Missing package for $cmd. Use menu 4."; return 1; }
+  done
+}
+backup() {
+  read_telegram
+  valid_token "$BOT_TOKEN" && valid_chat "$CHAT_ID" || { fail 'Configure Telegram in menu 2 first.'; return 1; }
+  check_deps || return 1
+  mkdir -p /root
+  exec 9>/run/nevermoressh-backup.lock
+  flock -n 9 || { warn 'Another backup is already running.'; return 1; }
+  local workdir ip domain stamp name archive bytes mb drive_ok=0 tg_ok=0 link='' tg_link='' response http tg_result message_id chat_type chat_username chat_id src dest
+  workdir=$(mktemp -d /root/.nevermoressh-backup.XXXXXXXX) || return 1
+  mkdir -p "$workdir/backup"
+  # Explicit cleanup, including on failure; archive is kept if uploads fail.
+  trap 'rm -rf -- "$workdir"' RETURN
+  ip=$(curl -4fsS --connect-timeout 5 --max-time 10 https://ipv4.icanhazip.com 2>/dev/null | tr -d '\r\n' || true)
+  [[ "$ip" =~ ^[0-9.]+$ ]] || ip='unknown-ip'
+  domain=$(cat /usr/local/etc/xray/domain 2>/dev/null || printf 'unknown-domain')
+  domain=$(printf '%s' "$domain" | tr -cd '[:alnum:]._-')
+  [[ -n "$domain" ]] || domain='unknown-domain'
+  stamp=$(date +'%Y-%m-%d-%H-%M-%S')
+  name="${ip}-${stamp}-${domain}-SkyNode.zip"
+  archive="/root/$name"
+  info 'VPS Data Backup By NevermoreSSH'
+  info 'Backing up SSH and XRAY configuration...'
+  while IFS='|' read -r src dest; do
+    if [[ -e "$src" ]]; then
+      cp -a -- "$src" "$workdir/backup/$dest" || { fail "Copy failed: $src"; return 1; }
+    else warn "Skipped missing path: $src"; fi
+  done <<'SOURCES'
+/usr/local/etc/xray|xray
+/etc/shadow|shadow
+/etc/gshadow|gshadow
+/etc/passwd|passwd
+/etc/group|group
+/usr/local/bin/show-vless|show-vless
+/etc/logcon/config|config
+SOURCES
+  info 'Compressing ZIP (no size limit for local archive)...'
+  (cd "$workdir" && zip -qr "$archive" backup) || { fail 'ZIP compression failed.'; return 1; }
+  [[ -s "$archive" ]] || { fail 'ZIP archive is empty or missing.'; return 1; }
+  bytes=$(stat -c %s "$archive")
+  mb=$(awk -v n="$bytes" 'BEGIN {printf "%.2f", n/1048576}')
+  info "ZIP size: ${mb} MB"
+  info 'Uploading to Google Drive...'
+  if rclone copyto "$archive" "${GDRIVE_REMOTE%/}/$name" --retries 3; then
+    drive_ok=1
+    link=$(rclone link "${GDRIVE_REMOTE%/}/$name" 2>/dev/null || true)
+    info 'Google Drive upload successful.'
+  else warn 'Google Drive upload failed.'; fi
+  info 'Uploading to Telegram...'
+  if (( bytes > 50000000 )); then
+    warn 'Telegram Bot API upload limit is 50 MB. Telegram upload skipped.'
+  else
+    response=$(mktemp)
+    http=$(curl -sS --connect-timeout 20 --max-time 600 --retry 2 -o "$response" -w '%{http_code}' \
+      -F "chat_id=$CHAT_ID" -F "document=@$archive" \
+      -F "caption=NevermoreSSH VPS Backup | $ip | $stamp" \
+      "https://api.telegram.org/bot${BOT_TOKEN}/sendDocument" || true)
+    if [[ "$http" == 200 ]] && python3 - "$response" <<'PY'
+import json,sys
+try:
+    with open(sys.argv[1]) as f: obj=json.load(f)
+    assert obj.get('ok') is True
+except Exception:
+    sys.exit(1)
+PY
+    then
+      tg_ok=1
+      tg_result=$(python3 - "$response" <<'PY'
+import json,sys
+x=json.load(open(sys.argv[1]))['result']; c=x.get('chat',{})
+print(x.get('message_id',''))
+print(c.get('type',''))
+print(c.get('username',''))
+print(c.get('id',''))
+PY
+)
+      message_id=$(printf '%s\n' "$tg_result" | sed -n '1p')
+      chat_type=$(printf '%s\n' "$tg_result" | sed -n '2p')
+      chat_username=$(printf '%s\n' "$tg_result" | sed -n '3p')
+      chat_id=$(printf '%s\n' "$tg_result" | sed -n '4p')
+      if [[ -n "$chat_username" && -n "$message_id" ]]; then
+        tg_link="https://t.me/${chat_username}/${message_id}"
+      elif [[ "$chat_type" == 'supergroup' || "$chat_type" == 'channel' ]] && [[ "$chat_id" =~ ^-100([0-9]+)$ ]]; then
+        tg_link="https://t.me/c/${BASH_REMATCH[1]}/${message_id}"
+      else
+        tg_link='Open your private Telegram bot chat (no public message URL available)'
+      fi
+      info 'Telegram upload successful.'
+    else warn "Telegram upload failed (HTTP $http)."; fi
+    rm -f -- "$response"
+  fi
+  printf '\n========================================\n'
+  printf ' VPS Data Backup By NevermoreSSH\n'
+  printf '========================================\n'
+  printf 'Your VPS IP : %s\nZIP Size    : %s MB\nFile        : %s\n' "$ip" "$mb" "$name"
+  (( drive_ok )) && printf 'Google Drive: SUCCESS\n' || printf 'Google Drive: FAILED\n'
+  (( tg_ok )) && printf 'Telegram    : SUCCESS\n' || printf 'Telegram    : FAILED\n'
+  printf 'Google Drive Link: %s\n' "${link:-Not available}"
+  printf 'Telegram Link    : %s\n' "${tg_link:-Not available}"
+  if (( drive_ok && tg_ok )); then
+    rm -f -- "$archive"
+    info 'Both uploads successful. Local ZIP removed.'
+  else
+    warn "At least one upload failed. Local ZIP retained: $archive"
+    return 1
+  fi
+}
+enable_auto() {
+  [[ -x "$SCRIPT_PATH" ]] || { fail "Install script at $SCRIPT_PATH first."; return 1; }
+  command -v cron >/dev/null || { fail 'Install cron using menu 4 first.'; return 1; }
+  cat > "$CRON_FILE" <<EOF
+# NevermoreSSH daily backup at 08:00 server local time
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+0 8 * * * root $SCRIPT_PATH --backup >> $LOG_FILE 2>&1
+EOF
+  chmod 644 "$CRON_FILE"
+  systemctl enable --now cron >/dev/null 2>&1 || service cron start || true
+  info 'Daily 08:00 server-local backup schedule installed.'
+}
+
+disable_auto() {
+  rm -f -- "$CRON_FILE"
+  info 'Daily backup schedule removed.'
+}
+menu() {
+  local choice token_status chat_status drive_status schedule_status
+  while true; do
+    read_telegram
+    token_status='NOT SET'; chat_status='NOT SET'; drive_status='NOT CONFIGURED'; schedule_status='DISABLED'
+    valid_token "$BOT_TOKEN" && token_status='SUCCESS'
+    valid_chat "$CHAT_ID" && chat_status='SUCCESS'
+    rclone listremotes 2>/dev/null | grep -Fxq 'dr:' && drive_status='CONFIGURED'
+    [[ -f "$CRON_FILE" ]] && schedule_status='ENABLED (08:00)'
+    clear 2>/dev/null || true
+    printf '========================================\n'
+    printf '     VPS Data Backup By NevermoreSSH\n'
+    printf '       Google Drive + Telegram\n'
+    printf '========================================\n\n'
+    printf '[ TELEGRAM CONFIGURATION ]\nBot Token : %s\nChat ID   : %s\n\n' "$token_status" "$chat_status"
+    printf '[ GOOGLE DRIVE ]\nRemote    : dr\nStatus    : %s\n\n' "$drive_status"
+    printf '[ AUTO BACKUP ]\nSchedule  : %s\n\n' "$schedule_status"
+    printf '========================================\n'
+    printf '[1] Backup VPS (Telegram + Google Drive)\n'
+    printf '[2] Set / Change Bot Token & Chat ID\n'
+    printf '[3] Reset Telegram to Default Settings\n'
+    printf '[4] Install Required Packages\n'
+    printf '[5] Enable Daily Backup (08:00)\n'
+    printf '[6] Disable Daily Backup\n'
+    printf '[7] View Backup Log\n'
+    printf '[0] Back To Main Menu\n'
+    printf '========================================\n'
+    read -r -p 'Select menu: ' choice || break
+    case "$choice" in
+      1) backup || true; pause ;;
+      2) set_telegram || true; pause ;;
+      3) reset_telegram || true; pause ;;
+      4) install_packages || true; pause ;;
+      5) enable_auto || true; pause ;;
+      6) disable_auto || true; pause ;;
+      7) if [[ -f "$LOG_FILE" ]]; then tail -n 60 "$LOG_FILE"; else info 'No backup log yet.'; fi; pause ;;
+      0) exec menu ;;
+      *) warn 'Invalid menu option.'; pause ;;
+    esac
+  done
+}
+[[ $(id -u) == 0 ]] || { fail 'Run this script as root.'; exit 1; }
+init_config
+case "${1:-}" in
+  --backup) backup ;;
+  --enable-auto) enable_auto ;;
+  --disable-auto) disable_auto ;;
+  '') menu ;;
+  *) fail 'Usage: backup-v2 [--backup|--enable-auto|--disable-auto]'; exit 1 ;;
+esac
