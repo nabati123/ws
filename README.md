@@ -11,9 +11,11 @@
 - Tested with VPS AWS, DigitalOcean, Vultr, GBcloud (Debian 11,12,13)
 
 Setup:
-```
-apt update -y && apt upgrade -y && apt dist-upgrade -y && apt install -y screen wget curl && wget https://raw.githubusercontent.com/nabati123/ws/main/install/setup.sh && chmod +x setup.sh && sed -i -e 's/\r$//' setup.sh && screen -S setup ./setup.sh
-```
+
+  ```html
+  apt update -y && apt upgrade -y && apt dist-upgrade -y && apt install -y screen wget curl && wget https://raw.githubusercontent.com/nabati123/ws/main/install/setup.sh && chmod +x setup.sh && sed -i -e 's/\r$//' setup.sh && screen -S setup ./setup.sh
+
+  ```
 
 Any Fix
 1. For Ubuntu22 or above got problem : Command 'menu' is available in '/usr/local/bin/menu' The command could not be located because '/usr/local/bin' is not included in the PATH environment variable. menu: command not found
